@@ -199,11 +199,14 @@ class Drone:
             if self.state == DroneState.RTB: self.run_rtb()
             return
 
-        # 2. Check for Reinforcement Calls (ORIGINAL NAME: check_reinforcements)
-        if self.state in [DroneState.PATROL, DroneState.ASSESS_THREAT, DroneState.ENGAGE, DroneState.WITHDRAW]:
+        # 2. Check for Reinforcement Calls
+        # Status 1 (ENGAGE) can check for calls from higher threats
+        # Status 2 (WITHDRAW/RTB) never checks (focus on survival)
+        if self.state in [DroneState.PATROL, DroneState.ENGAGE]:
             call_target = self.check_reinforcements(heartbeats, sim_time)
-            if call_target:
+            if call_target is not None:
                 self.target = call_target
+                self.add_log(sim_time, "Reinforcement", "Responding to distress call")
                 self.set_state(sim_time, DroneState.DEFEND_ASSET) 
                 return
 
@@ -231,6 +234,7 @@ class Drone:
 
         best_call_pos = None
         highest_urgency = -1.0
+        urgency_threshold = 1200.0  # Only respond to high-threat situations
 
         for hb in heartbeats:
             caller_id = hb['id']
@@ -246,17 +250,21 @@ class Drone:
             except:
                 continue
 
+            # Only respond to URGENT calls (high threat scores)
+            if caller_score < urgency_threshold:
+                continue
+
             should_help = False
             
             if my_status == 0:
                 should_help = True
             elif my_status == 1:
-                if caller_score > my_score:
+                if caller_score > my_score + 400.0:  # Must be significantly higher threat
                     should_help = True
             
             if should_help and caller_score > highest_urgency:
                 highest_urgency = caller_score
-                best_call_pos = Drone(caller_id, DroneType.FRIENDLY, hb['pos'])
+                best_call_pos = np.array(hb['pos'], dtype=float)
 
         return best_call_pos
 
@@ -285,13 +293,25 @@ class Drone:
             if e.drone_type == DroneType.HOSTILE_GROUND: ground_enemies += 1
             elif e.drone_type == DroneType.HOSTILE_AIR: air_enemies += 1
         
-        if ground_enemies == 0 and air_enemies == 0: return 0.0
-        if air_enemies == 0 and ground_enemies > 0: return 0.0
-        if ground_enemies > air_enemies: return 600.0
-        if air_enemies > ground_enemies: return 1400.0
-        if ground_enemies == 0 and air_enemies > 0: return 2000.0
-            
-        return 1000.0 
+        # No enemies detected
+        if ground_enemies == 0 and air_enemies == 0:
+            return 0.0
+        
+        # Ground only - Low priority (they're slow and target asset)
+        if air_enemies == 0 and ground_enemies > 0:
+            return 0.0
+        
+        # Air only - MAXIMUM THREAT (they hunt drones!)
+        if ground_enemies == 0 and air_enemies > 0:
+            return 2000.0
+        
+        # Mixed threats - Prioritize based on ratio
+        if air_enemies > ground_enemies:
+            return 1400.0  # Air dominant - high threat
+        elif ground_enemies > air_enemies:
+            return 600.0   # Ground dominant - moderate threat
+        else:
+            return 1000.0  # Equal numbers - balanced threat 
 
     def get_saturation_penalty(self, target_id):
         """
@@ -310,25 +330,6 @@ class Drone:
             self.set_state(sim_time, DroneState.PATROL)
             return
 
-        # --- RESERVE GUARD LOGIC (NEW) ---
-        # Strategy: Keep 2 drones back as reserves until our numbers drop to 4 (50%).
-        all_ids = [self.id] + [hb['id'] for hb in heartbeats]
-        all_ids.sort() # Deterministic ordering (F0, F1, F2...)
-        
-        survivor_count = len(all_ids)
-        
-        # If we have healthy numbers (> 4), the last 2 drones in the list hold back.
-        if survivor_count > 4:
-            my_rank = all_ids.index(self.id)
-            if my_rank >= (survivor_count - 2):
-                # I am a reserve unit!
-                # Instead of engaging, hold position near the base/asset.
-                self.add_log(sim_time, "Reserve", "Holding Base Position (Reserve Guard)")
-                # Maintain altitude, hover near 0,0
-                self.maneuver_to_point(np.array([0, 0, 100]), 1.0)
-                return 
-        # ---------------------------------
-
         # END GAME LOGIC: If only 1 enemy, Kill. If many, Coordinate.
         is_end_game = (len(active_enemies) == 1)
 
@@ -341,9 +342,9 @@ class Drone:
             
             # Smart Saturation
             if is_end_game:
-                penalty = 0.0 # KILL MODE: No hesitation
+                penalty = 0.0  # KILL MODE: No hesitation
             else:
-                penalty = self.get_saturation_penalty(enemy.id) # SWARM MODE: Spread out
+                penalty = self.get_saturation_penalty(enemy.id)  # SWARM MODE: Spread out
             
             final_score = dist + type_bias + penalty
             
@@ -382,13 +383,17 @@ class Drone:
         self.maneuver_intercept(evasion=False)
 
     def run_defend_asset(self, sim_time):
-        if not self.target:
+        if not self.target or not isinstance(self.target, np.ndarray):
             self.set_state(sim_time, DroneState.ASSESS_THREAT)
             return
             
-        self.maneuver_to_point(self.target.position, speed_multiplier=1.0, evasion=True)
+        # Move to the reinforcement location
+        dist = np.linalg.norm(self.position - self.target)
+        self.maneuver_to_point(self.target, speed_multiplier=1.0, evasion=False)
         
-        if np.linalg.norm(self.position - self.target.position) < 200:
+        # Once we arrive at the location, reassess the situation
+        if dist < 400:
+            self.add_log(sim_time, "Reinforcement", f"Arrived at call location (dist: {dist:.0f}m)")
             self.set_state(sim_time, DroneState.ASSESS_THREAT)
 
     def run_withdraw(self, sim_time, heartbeats):

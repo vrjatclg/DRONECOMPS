@@ -20,7 +20,16 @@ MAX_FIRING_RANGE_SQ = MAX_FIRING_RANGE ** 2
 SENSOR_RANGE_MAX_SQ = SENSOR_RANGE_MAX ** 2
 THREAT_RANGE_AIR = 100.0
 THREAT_RANGE_AIR_SQ = THREAT_RANGE_AIR ** 2
-IDEAL_FIRING_RANGE = 150.0
+IDEAL_FIRING_RANGE = 120.0
+
+# --- STATE TRANSITION THRESHOLDS ---
+ASSESS_THREAT_RANGE = 1500.0  # Enemy detection range for ASSESS_THREAT
+ASSESS_THREAT_RANGE_SQ = ASSESS_THREAT_RANGE ** 2
+
+WITHDRAW_THRESHOLD = 1200.0  # Threat score for WITHDRAW
+COORDINATE_ALLY_THRESHOLD = 2  # Min allies needed before transitioning from COORDINATE
+DEFEND_ASSET_RANGE = 800.0  # Range to asset for DEFEND_ASSET
+DEFEND_ASSET_RANGE_SQ = DEFEND_ASSET_RANGE ** 2
 
 # --- FLOCKING & EVASION CONSTANTS ---
 SEPARATION_WEIGHT = 50.0
@@ -30,20 +39,18 @@ AVOID_RADIUS = 15.0
 EVASION_STRENGTH = 15.0 
 
 # --- SWARM INTELLIGENCE CONSTANTS ---
-ACTION_THRESHOLD = 3          # Neighbors needed to feel safe
-CLOSE_FORMATION_RANGE = 800.0 # Range to count as a "Neighbor"
+ACTION_THRESHOLD = 2
+CLOSE_FORMATION_RANGE = 1000.0
 EASY_KILL_RANGE = 600.0      
 
 # --- TOP CODER LOGIC CONSTANT ---
-# 400.0 means: "I'd rather fly 400m further than attack a target my friend is already hitting."
-SATURATION_PENALTY_WEIGHT = 400.0 
+SATURATION_PENALTY_WEIGHT = 150.0
 
-# --- MONTE CARLO COMBAT CONSTANTS (ORIGINAL HIGH ACCURACY) ---
-HIT_ACCURACY = 0.90          # 90% Accuracy
-DAMAGE_VARIANCE = 0.15       # +/- 15% Damage
-# 2.5kg / 0.5kg = 5 Shots (Very limited ammo, requires smart usage)
+# --- MONTE CARLO COMBAT CONSTANTS ---
+HIT_ACCURACY = 0.90
+DAMAGE_VARIANCE = 0.15
 AMMO_PER_SHOT_WEIGHT = 0.5   
-FIXED_SHOT_DAMAGE = 50       # Base damage (2-3 hits to kill 100HP target)
+FIXED_SHOT_DAMAGE = 50
 
 class DroneType(Enum):
     FRIENDLY = 1
@@ -53,13 +60,11 @@ class DroneType(Enum):
 class DroneState(Enum):
     PATROL = 1
     ASSESS_THREAT = 2
-    ENGAGE = 3
-    DEFEND_ASSET = 4
+    WITHDRAW = 3
+    COORDINATE = 4
+    DEFEND_ASSET = 5
     RTB = 6
-    DESTROYED = 7
-    ATTACKING = 8
-    # REARM Removed - One way mission only
-    WITHDRAW = 10 
+    DESTROYED = 7  # Can happen at ANY point
 
 class GroundAsset:
     def __init__(self, id, position, patrol_radius):
@@ -76,7 +81,8 @@ class GroundAsset:
             self.health = 0
 
 class Drone:
-    """Implements ISP with Priority Cost Hierarchy & Smart Reinforcement"""
+    """Linear FSM: PATROL → ASSESS_THREAT → WITHDRAW → COORDINATE → DEFEND_ASSET → RTB
+       DESTROYED can happen at any point during combat"""
     def __init__(self, id, drone_type, position, communication_enabled=False, ammo_per_shot_weight=AMMO_PER_SHOT_WEIGHT, shot_damage=FIXED_SHOT_DAMAGE, health=100, fuel=5000.0):
         
         self.id = id
@@ -97,8 +103,9 @@ class Drone:
         self.ammo_count = self.max_ammo
         self.shot_damage = shot_damage
         
-        # Stores the last calculated threat score for logging & broadcasting
         self.last_threat_score = 0.0
+        self.ground_enemy_count = 0
+        self.air_enemy_count = 0
 
         self.fire_rate = 1.0 
         self.fire_cooldown = 0.0
@@ -116,12 +123,15 @@ class Drone:
         self.target = None 
         self.rtb_reason = None
         self.patrol_target_pos = None
+        
+        self.withdraw_start_time = None
+        self.coordinate_start_time = None
 
     # --- LOGGING UTILS ---
     def add_log(self, sim_time, event_type, details=""):
         status = self.get_protocol_status()
         status_str = str(status)
-        if status != 0:
+        if status in [1, 2, 3]:
              status_str = f"{status}:{self.last_threat_score:.1f}"
              
         self.log.append({
@@ -136,20 +146,34 @@ class Drone:
         self.log = []
         return logs
 
-    # --- PROTOCOL MAPPING ---
+    # --- PROTOCOL MAPPING (NEW LOGIC) ---
     def get_protocol_status(self):
         """
         0 = PATROL 
-        1 = ENGAGE (Withdraw = False)
-        2 = PINNED/WITHDRAW/RTB (Withdraw = True)
+        1 = Ground Threat Only (can call PATROL or status 1 with lower threat)
+        2 = Air Threat Only (can call PATROL only)
+        3 = Mixed Threat (can call PATROL or status 1 with lower threat)
+        4 = DEFEND_ASSET (Coordinated Defense)
+        5 = RTB (Mission End)
+        6 = DESTROYED
         """
-        if self.state in [DroneState.PATROL, DroneState.ASSESS_THREAT]:
+        if self.state == DroneState.PATROL:
             return 0
-        elif self.state in [DroneState.ENGAGE, DroneState.DEFEND_ASSET, DroneState.ATTACKING]:
-            return 1
-        elif self.state in [DroneState.WITHDRAW, DroneState.RTB, DroneState.DESTROYED]:
-            return 2
-        return 0 
+        elif self.state == DroneState.RTB:
+            return 5
+        elif self.state == DroneState.DESTROYED:
+            return 6
+        elif self.state == DroneState.DEFEND_ASSET:
+            return 4
+        elif self.state in [DroneState.ASSESS_THREAT, DroneState.WITHDRAW, DroneState.COORDINATE]:
+            # Determine status based on enemy composition
+            if self.air_enemy_count == 0 and self.ground_enemy_count > 0:
+                return 1  # Ground only
+            elif self.ground_enemy_count == 0 and self.air_enemy_count > 0:
+                return 2  # Air only
+            elif self.air_enemy_count > 0 and self.ground_enemy_count > 0:
+                return 3  # Mixed threat
+        return 0
 
     # --- SENSORS & SCANS ---
     def scan(self, all_drones, all_assets, sim_time, delta_time):
@@ -187,85 +211,68 @@ class Drone:
         else:
             self.run_hostile_ai(sim_time) 
         
-        return self.target.id if (self.target and hasattr(self.target, 'id')) else None
+        return self.target.id if (self.target is not None and hasattr(self.target, 'id')) else None
 
-    # --- FRIENDLY FSM ---
+    # --- FRIENDLY LINEAR FSM ---
     def run_friendly_fsm(self, sim_time, heartbeats): 
-        # 1. Critical Status Check (One-way RTB)
+        # 1. Critical Status Check (RTB or DESTROYED can happen anytime)
         self.check_combat_effectiveness(sim_time)
         
-        # If RTB or Dead, we stop all logic and just exit/fly home.
         if self.state in [DroneState.RTB, DroneState.DESTROYED]:
             if self.state == DroneState.RTB: self.run_rtb()
             return
 
-        # 2. Check for Reinforcement Calls (ORIGINAL NAME: check_reinforcements)
-        if self.state in [DroneState.PATROL, DroneState.ASSESS_THREAT, DroneState.ENGAGE, DroneState.WITHDRAW]:
-            call_target = self.check_reinforcements(heartbeats, sim_time)
-            if call_target:
-                self.target = call_target
-                self.set_state(sim_time, DroneState.DEFEND_ASSET) 
-                return
+        # 2. Check for coordinate calls and respond (ONLY if communication enabled)
+        if self.communication_enabled and self.state == DroneState.PATROL:
+            self.check_and_respond_to_calls(heartbeats, sim_time)
 
-        # 3. Standard State Machine
+        # 3. Linear State Machine Flow
         if self.state == DroneState.PATROL:
             self.run_patrol(sim_time)
+            
         elif self.state == DroneState.ASSESS_THREAT:
             self.run_assess_threat(sim_time, heartbeats)
-        elif self.state == DroneState.ENGAGE:
-            self.run_engage(sim_time)
+            
+        elif self.state == DroneState.WITHDRAW:
+            # WITHDRAW only runs if communication is enabled
+            if self.communication_enabled:
+                self.run_withdraw(sim_time, heartbeats)
+            else:
+                # If somehow in WITHDRAW with communication off, go back to ASSESS_THREAT
+                self.set_state(sim_time, DroneState.ASSESS_THREAT)
+            
+        elif self.state == DroneState.COORDINATE:
+            # COORDINATE only runs if communication is enabled
+            if self.communication_enabled:
+                self.run_coordinate(sim_time, heartbeats)
+            else:
+                # If somehow in COORDINATE with communication off, go back to ASSESS_THREAT
+                self.set_state(sim_time, DroneState.ASSESS_THREAT)
+            
         elif self.state == DroneState.DEFEND_ASSET:
             self.run_defend_asset(sim_time)
-        elif self.state == DroneState.WITHDRAW:
-            self.run_withdraw(sim_time, heartbeats)
 
-    # --- REINFORCEMENT LOGIC (ORIGINAL NAME) ---
-    def check_reinforcements(self, heartbeats, sim_time):
-        """
-        Determines if this drone should answer an 'Engage Call'.
-        """
-        my_status = self.get_protocol_status()
-        my_score = self.last_threat_score
-        
-        if my_status == 2 and self.state != DroneState.WITHDRAW: return None
-
-        best_call_pos = None
-        highest_urgency = -1.0
-
-        for hb in heartbeats:
-            caller_id = hb['id']
-            if caller_id == self.id: continue
-            
-            hb_code = str(hb.get('status', '0'))
-            if ':' not in hb_code: continue 
-            
-            try:
-                s_code, s_score = hb_code.split(':')
-                caller_status = int(s_code)
-                caller_score = float(s_score)
-            except:
-                continue
-
-            should_help = False
-            
-            if my_status == 0:
-                should_help = True
-            elif my_status == 1:
-                if caller_score > my_score:
-                    should_help = True
-            
-            if should_help and caller_score > highest_urgency:
-                highest_urgency = caller_score
-                best_call_pos = Drone(caller_id, DroneType.FRIENDLY, hb['pos'])
-
-        return best_call_pos
-
-    # --- STATE HANDLERS ---
+    # --- STATE HANDLERS (LINEAR FLOW) ---
+    
     def run_patrol(self, sim_time):
-        if any(e.state != DroneState.DESTROYED for e in self.detected_enemies.values()):
+        """PATROL → ASSESS_THREAT when enemies detected"""
+        
+        # Check for enemies in range
+        enemies_in_range = False
+        for enemy in self.detected_enemies.values():
+            if enemy.state == DroneState.DESTROYED:
+                continue
+            dist_sq = np.dot(enemy.position - self.position, enemy.position - self.position)
+            if dist_sq <= ASSESS_THREAT_RANGE_SQ:
+                enemies_in_range = True
+                break
+        
+        if enemies_in_range:
+            self.add_log(sim_time, "Transition", "PATROL → ASSESS_THREAT: Enemies detected")
             self.set_state(sim_time, DroneState.ASSESS_THREAT)
             return
-
+        
+        # Normal patrol behavior
         if self.known_assets:
             asset = self.known_assets[0]
             if self.patrol_target_pos is None or np.linalg.norm(self.position - self.patrol_target_pos) < 50:
@@ -274,138 +281,121 @@ class Drone:
                 self.patrol_target_pos = asset.position + np.array([np.cos(angle)*r, np.sin(angle)*r, 100])
             self.maneuver_to_point(self.patrol_target_pos, speed_multiplier=0.6)
         else:
-            self.velocity *= 0.9 
+            self.velocity *= 0.9
 
     def calculate_cost(self):
-        ground_enemies = 0
-        air_enemies = 0
+        """Calculate threat level and update enemy counts"""
+        self.ground_enemy_count = 0
+        self.air_enemy_count = 0
         
         for e in self.detected_enemies.values():
             if e.state == DroneState.DESTROYED: continue
-            if e.drone_type == DroneType.HOSTILE_GROUND: ground_enemies += 1
-            elif e.drone_type == DroneType.HOSTILE_AIR: air_enemies += 1
+            if e.drone_type == DroneType.HOSTILE_GROUND: self.ground_enemy_count += 1
+            elif e.drone_type == DroneType.HOSTILE_AIR: self.air_enemy_count += 1
         
-        if ground_enemies == 0 and air_enemies == 0: return 0.0
-        if air_enemies == 0 and ground_enemies > 0: return 0.0
-        if ground_enemies > air_enemies: return 600.0
-        if air_enemies > ground_enemies: return 1400.0
-        if ground_enemies == 0 and air_enemies > 0: return 2000.0
-            
-        return 1000.0 
-
-    def get_saturation_penalty(self, target_id):
-        """
-        Calculates how 'crowded' a target is.
-        """
-        attackers = 0
-        for friend in self.detected_friendlies.values():
-            if friend.state in [DroneState.ENGAGE, DroneState.ATTACKING]:
-                if friend.target and hasattr(friend.target, 'id') and friend.target.id == target_id:
-                    attackers += 1
-        return attackers * SATURATION_PENALTY_WEIGHT
+        if self.ground_enemy_count == 0 and self.air_enemy_count == 0:
+            return 0.0
+        
+        if self.air_enemy_count == 0 and self.ground_enemy_count > 0:
+            return 500.0  # Low threat - ground only
+        
+        if self.ground_enemy_count == 0 and self.air_enemy_count > 0:
+            return 2000.0  # High threat - air
+        
+        if self.air_enemy_count > self.ground_enemy_count:
+            return 1800.0  # Very high threat
+        elif self.ground_enemy_count > self.air_enemy_count:
+            return 800.0  # Medium threat
+        else:
+            return 1400.0  # High threat - mixed
 
     def run_assess_threat(self, sim_time, heartbeats):
+        """ASSESS_THREAT → WITHDRAW if threat score high and outnumbered (ONLY if communication enabled)
+           ASSESS_THREAT → DEFEND_ASSET if ground within 100m of asset + air combat active
+           ASSESS_THREAT → PATROL if no threats"""
+        
         active_enemies = [e for e in self.detected_enemies.values() if e.state != DroneState.DESTROYED]
+        
+        # No enemies - back to patrol
         if not active_enemies:
+            self.add_log(sim_time, "Transition", "ASSESS_THREAT → PATROL: Threats cleared")
             self.set_state(sim_time, DroneState.PATROL)
             return
-
-        # --- RESERVE GUARD LOGIC (NEW) ---
-        # Strategy: Keep 2 drones back as reserves until our numbers drop to 4 (50%).
-        all_ids = [self.id] + [hb['id'] for hb in heartbeats]
-        all_ids.sort() # Deterministic ordering (F0, F1, F2...)
         
-        survivor_count = len(all_ids)
-        
-        # If we have healthy numbers (> 4), the last 2 drones in the list hold back.
-        if survivor_count > 4:
-            my_rank = all_ids.index(self.id)
-            if my_rank >= (survivor_count - 2):
-                # I am a reserve unit!
-                # Instead of engaging, hold position near the base/asset.
-                self.add_log(sim_time, "Reserve", "Holding Base Position (Reserve Guard)")
-                # Maintain altitude, hover near 0,0
-                self.maneuver_to_point(np.array([0, 0, 100]), 1.0)
-                return 
-        # ---------------------------------
-
-        # END GAME LOGIC: If only 1 enemy, Kill. If many, Coordinate.
-        is_end_game = (len(active_enemies) == 1)
-
-        best_target = None
-        best_score = float('inf')
-
-        for enemy in active_enemies:
-            dist = np.linalg.norm(enemy.position - self.position)
-            type_bias = -10000.0 if enemy.drone_type == DroneType.HOSTILE_GROUND else 0.0
-            
-            # Smart Saturation
-            if is_end_game:
-                penalty = 0.0 # KILL MODE: No hesitation
-            else:
-                penalty = self.get_saturation_penalty(enemy.id) # SWARM MODE: Spread out
-            
-            final_score = dist + type_bias + penalty
-            
-            if final_score < best_score:
-                best_score = final_score
-                best_target = enemy
-
-        self.target = best_target
-        
-        # [PRESERVED PRIORITY LOGIC]
+        # Calculate threat
         my_cost = self.calculate_cost()
         self.last_threat_score = my_cost
         
-        if my_cost >= 2000.0:
-            nearby_allies = 0
-            for hb in heartbeats:
-                if np.linalg.norm(np.array(hb['pos']) - self.position) < CLOSE_FORMATION_RANGE:
-                    nearby_allies += 1
+        # Check for DEFEND_ASSET trigger: ground enemies within 100m of ASSET + air enemies present
+        if self.ground_enemy_count > 0 and self.air_enemy_count > 0 and self.known_assets:
+            asset = self.known_assets[0]
+            ground_threat_critical = False
             
-            if nearby_allies < ACTION_THRESHOLD:
-                self.set_state(sim_time, DroneState.WITHDRAW)
-                self.add_log(sim_time, "Distress", f"Pinned by Air. Cost: {my_cost}")
-            else:
-                self.set_state(sim_time, DroneState.ENGAGE)
-        else:
-            self.set_state(sim_time, DroneState.ENGAGE)
-            if my_cost == 0.0:
-                self.add_log(sim_time, "Engage", "Priority: Ground Only")
-            else:
-                self.add_log(sim_time, "Engage", f"Priority: Mixed (Cost {my_cost})")
-
-    def run_engage(self, sim_time):
-        if not self.target or self.target.state == DroneState.DESTROYED:
-            self.set_state(sim_time, DroneState.ASSESS_THREAT)
-            return
-        self.maneuver_intercept(evasion=False)
-
-    def run_defend_asset(self, sim_time):
-        if not self.target:
-            self.set_state(sim_time, DroneState.ASSESS_THREAT)
-            return
+            for e in self.detected_enemies.values():
+                if e.state == DroneState.DESTROYED:
+                    continue
+                if e.drone_type == DroneType.HOSTILE_GROUND:
+                    dist_to_asset_sq = np.dot(e.position - asset.position, e.position - asset.position)
+                    if dist_to_asset_sq <= THREAT_RANGE_AIR_SQ:  # 100m from asset
+                        ground_threat_critical = True
+                        break
             
-        self.maneuver_to_point(self.target.position, speed_multiplier=1.0, evasion=True)
+            if ground_threat_critical:
+                self.add_log(sim_time, "Transition", "ASSESS_THREAT → DEFEND_ASSET: Ground within 100m of asset + air combat!")
+                self.set_state(sim_time, DroneState.DEFEND_ASSET)
+                return
         
-        if np.linalg.norm(self.position - self.target.position) < 200:
-            self.set_state(sim_time, DroneState.ASSESS_THREAT)
+        # Select target
+        best_target = min(active_enemies, key=lambda e: np.linalg.norm(e.position - self.position))
+        self.target = best_target
+        
+        # Check if need to withdraw (ONLY if communication enabled)
+        if self.communication_enabled:
+            nearby_allies = len(self.detected_friendlies)
+            
+            if my_cost >= WITHDRAW_THRESHOLD and nearby_allies < ACTION_THRESHOLD:
+                self.withdraw_start_time = sim_time
+                self.add_log(sim_time, "Transition", f"ASSESS_THREAT → WITHDRAW: High threat ({my_cost:.0f}), outnumbered")
+                self.set_state(sim_time, DroneState.WITHDRAW)
+                return
+        
+        # Stay in ASSESS_THREAT and engage
+        nearby_allies = len(self.detected_friendlies)
+        self.maneuver_intercept(evasion=False)
+        self.add_log(sim_time, "Combat", f"Engaging in ASSESS_THREAT (Threat: {my_cost:.0f}, Allies: {nearby_allies})")
 
     def run_withdraw(self, sim_time, heartbeats):
-        nearby_allies = 0
-        for hb in heartbeats:
-            if np.linalg.norm(np.array(hb['pos']) - self.position) < CLOSE_FORMATION_RANGE:
-                nearby_allies += 1
-                
+        """WITHDRAW → COORDINATE after withdrawing for some time
+           WITHDRAW → ASSESS_THREAT if reinforcements arrive"""
+        
+        # Check if reinforcements arrived
+        nearby_allies = len(self.detected_friendlies)
         if nearby_allies >= ACTION_THRESHOLD:
+            self.add_log(sim_time, "Transition", f"WITHDRAW → ASSESS_THREAT: Reinforcements arrived ({nearby_allies} allies)")
             self.set_state(sim_time, DroneState.ASSESS_THREAT)
-            self.add_log(sim_time, "Re-Engage", "Reinforcements Arrived")
+            self.withdraw_start_time = None
             return
-
-        if not self.target:
-            self.set_state(sim_time, DroneState.ASSESS_THREAT)
+        
+        # Check if threats cleared
+        active_enemies = [e for e in self.detected_enemies.values() if e.state != DroneState.DESTROYED]
+        if not active_enemies:
+            self.add_log(sim_time, "Transition", "WITHDRAW → PATROL: Threats cleared during withdrawal")
+            self.set_state(sim_time, DroneState.PATROL)
+            self.withdraw_start_time = None
             return
-
+        
+        # Withdraw for 5 seconds then call for help
+        if self.withdraw_start_time and (sim_time - self.withdraw_start_time) >= 5.0:
+            self.coordinate_start_time = sim_time
+            self.add_log(sim_time, "Transition", "WITHDRAW → COORDINATE: Requesting reinforcements")
+            self.set_state(sim_time, DroneState.COORDINATE)
+            self.withdraw_start_time = None
+            return
+        
+        # Continue withdrawing
+        if self.target is None:
+            self.target = active_enemies[0]
+        
         vec_away = self.position - self.target.position
         dist = np.linalg.norm(vec_away)
         if dist > 0: vec_away /= dist
@@ -414,17 +404,136 @@ class Drone:
         d_safe = np.linalg.norm(vec_safe)
         if d_safe > 0: vec_safe /= d_safe
 
-        final_vec = (vec_away * 0.6) + (vec_safe * 0.4)
+        final_vec = (vec_away * 0.7) + (vec_safe * 0.3)
         final_vec = (final_vec / np.linalg.norm(final_vec)) * self.max_speed
         
         self.velocity = (self.velocity * 0.8) + (final_vec * 0.2)
-        
-        if dist > 800:
-            self.set_state(sim_time, DroneState.ASSESS_THREAT)
 
-    # --- PHYSICS & COMBAT (AGGRESSIVE STRAIGHT LINE) ---
+    def run_coordinate(self, sim_time, heartbeats):
+        """COORDINATE → DEFEND_ASSET when allies arrive
+           COORDINATE → PATROL if threats cleared"""
+        
+        # Check if threats cleared
+        active_enemies = [e for e in self.detected_enemies.values() if e.state != DroneState.DESTROYED]
+        if not active_enemies:
+            self.add_log(sim_time, "Transition", "COORDINATE → PATROL: Threats eliminated")
+            self.set_state(sim_time, DroneState.PATROL)
+            self.coordinate_start_time = None
+            return
+        
+        # Check if reinforcements arrived
+        nearby_allies = len(self.detected_friendlies)
+        if nearby_allies >= COORDINATE_ALLY_THRESHOLD:
+            self.add_log(sim_time, "Transition", f"COORDINATE → DEFEND_ASSET: {nearby_allies} allies responded")
+            if self.known_assets:
+                self.target = self.known_assets[0]
+            self.set_state(sim_time, DroneState.DEFEND_ASSET)
+            self.coordinate_start_time = None
+            return
+        
+        # Hold position and fight defensively
+        nearest_enemy = min(active_enemies, key=lambda e: np.linalg.norm(e.position - self.position))
+        self.target = nearest_enemy
+        self.maneuver_intercept(evasion=True)
+        
+        # Broadcast every 2 seconds
+        if self.coordinate_start_time and (sim_time - self.coordinate_start_time) % 2.0 < 0.1:
+            self.add_log(sim_time, "Broadcast", f"COORDINATE active: Need backup! (Allies: {nearby_allies})")
+
+    def check_and_respond_to_calls(self, heartbeats, sim_time):
+        """Check for coordinate calls and respond based on status code rules"""
+        if not heartbeats:
+            return
+        
+        my_status = self.get_protocol_status()
+        
+        # Only PATROL drones can respond
+        if my_status != 0:
+            return
+        
+        for hb in heartbeats:
+            if hb['id'] == self.id:
+                continue
+            
+            # Check if drone is in COORDINATE state
+            if hb.get('state') != DroneState.COORDINATE:
+                continue
+            
+            # Parse caller's status
+            caller_status_str = hb.get('status', '0')
+            try:
+                if ':' in caller_status_str:
+                    caller_status = int(caller_status_str.split(':')[0])
+                    caller_threat = float(caller_status_str.split(':')[1])
+                else:
+                    caller_status = int(caller_status_str)
+                    caller_threat = 0.0
+            except:
+                continue
+            
+            # Apply response rules based on caller's status code
+            should_respond = False
+            
+            if caller_status == 1:  # Ground threat only
+                # Can call PATROL (status 0) - we are patrol, so respond
+                should_respond = True
+                
+            elif caller_status == 2:  # Air threat only
+                # Can ONLY call PATROL (status 0) - we are patrol, so respond
+                should_respond = True
+                
+            elif caller_status == 3:  # Mixed threat
+                # Can call PATROL (status 0) - we are patrol, so respond
+                should_respond = True
+            
+            if should_respond:
+                call_pos = np.array(hb['pos'], dtype=float)
+                dist = np.linalg.norm(call_pos - self.position)
+                self.add_log(sim_time, "Response", f"Responding to COORDINATE call (Status {caller_status}, Dist: {dist:.0f}m)")
+                # Move towards the calling drone
+                self.patrol_target_pos = call_pos
+                return
+
+    def run_defend_asset(self, sim_time):
+        """DEFEND_ASSET → RTB when mission complete or critical
+           DEFEND_ASSET → PATROL when area secured"""
+        
+        # Check if all threats eliminated
+        active_enemies = [e for e in self.detected_enemies.values() if e.state != DroneState.DESTROYED]
+        
+        if not active_enemies:
+            self.add_log(sim_time, "Transition", "DEFEND_ASSET → PATROL: Area secured")
+            self.set_state(sim_time, DroneState.PATROL)
+            return
+        
+        # Defend the asset
+        if self.known_assets:
+            asset = self.known_assets[0]
+            
+            # Find closest threat to asset
+            nearest_threat = min(active_enemies, 
+                               key=lambda e: np.linalg.norm(e.position - asset.position))
+            
+            self.target = nearest_threat
+            
+            # Position between threat and asset
+            dist_to_asset = np.linalg.norm(self.position - asset.position)
+            
+            if dist_to_asset < DEFEND_ASSET_RANGE:
+                # Close to asset - intercept threats
+                self.maneuver_intercept(evasion=False)
+            else:
+                # Too far - move closer to asset
+                self.maneuver_to_point(asset.position, speed_multiplier=1.0)
+        else:
+            # No asset - just engage
+            self.target = active_enemies[0]
+            self.maneuver_intercept(evasion=False)
+
+    # --- PHYSICS & COMBAT ---
     def maneuver_intercept(self, evasion=False):
-        if not self.target: return
+        if self.target is None: 
+            return
         
         if not hasattr(self.target, 'velocity'):
             self.maneuver_to_point(self.target.position, 1.0, evasion)
@@ -439,7 +548,7 @@ class Drone:
             vec_to_asset = asset_pos - self.target.position
             d_asset = np.linalg.norm(vec_to_asset)
             if d_asset > IDEAL_FIRING_RANGE:
-                predicted_pos = self.target.position + (vec_to_asset / d_asset) * (d_asset * 0.7)
+                predicted_pos = self.target.position + (vec_to_asset / d_asset) * (d_asset * 0.6)
 
         vec_to_fut = predicted_pos - self.position
         d_fut = np.linalg.norm(vec_to_fut)
@@ -467,32 +576,30 @@ class Drone:
         if health is not None: self.max_health = float(health); self.health = float(health)
         if ammo is not None: self.ammo_count = int(ammo)
 
-    # --- UPDATED: ONE-WAY RTB LOGIC (No Rearm Loop) ---
     def check_combat_effectiveness(self, sim_time):
-        if self.state in [DroneState.RTB, DroneState.DESTROYED]: return
+        """Can trigger RTB or DESTROYED at any point"""
+        if self.state in [DroneState.RTB, DroneState.DESTROYED]: 
+            return
         
-        # If ammo is out -> RTB (Mission Over)
         if self.ammo_count <= 0:
             self.set_state(sim_time, DroneState.RTB)
             self.add_log(sim_time, "RTB", "Ammo Depleted (Mission End)")
             self.rtb_reason = "Ammo Depleted"
             
-        # If Fuel/Health Critical -> RTB (Mission Over)
-        elif self.fuel < 200 or self.health < 30:
+        elif self.fuel < 200 or self.health < 20:
             self.set_state(sim_time, DroneState.RTB)
             self.add_log(sim_time, "RTB", "Critical Levels (Mission End)")
-            self.rtb_reason = "Critical Damage" if self.health < 30 else "Low Fuel"
+            self.rtb_reason = "Critical Damage" if self.health < 20 else "Low Fuel"
 
     def run_rtb(self):
-        # Fly to base and stay there.
         self.maneuver_to_point(np.array([0,0,100]), 1.0)
 
     def set_state(self, sim_time, new_state):
         if self.state != new_state:
-            self.add_log(sim_time, "State Change", f"{self.state.name} -> {new_state.name}")
+            self.add_log(sim_time, "State Change", f"{self.state.name} → {new_state.name}")
             self.state = new_state
 
-    # --- ORIGINAL COMBAT (HIGH ACCURACY / VARIANCE) ---
+    # --- COMBAT ---
     def fire_shot(self):
         if self.ammo_count > 0:
             self.ammo_count -= 1
@@ -503,16 +610,20 @@ class Drone:
         return False
     
     def take_damage(self, damage, sim_time):
+        """DESTROYED can happen at ANY point during combat"""
         if self.state != DroneState.DESTROYED:
             self.health -= damage
             if self.health <= 0:
                 self.health = 0
+                self.add_log(sim_time, "DESTROYED", f"Eliminated (was in {self.state.name})")
                 self.set_state(sim_time, DroneState.DESTROYED) 
                 self.velocity = np.zeros(3)
 
     def try_firing(self, sim_time):
-        if not self.target: return
-        if hasattr(self.target, 'drone_type') and self.target.drone_type == self.drone_type: return
+        if self.target is None or isinstance(self.target, np.ndarray): 
+            return
+        if hasattr(self.target, 'drone_type') and self.target.drone_type == self.drone_type: 
+            return
         
         if self.fire_cooldown <= 0:
             dist_sq = np.dot(self.position - self.target.position, self.position - self.target.position)
@@ -536,7 +647,7 @@ class Drone:
         if self.state != DroneState.DESTROYED:
             status = self.get_protocol_status()
             status_str = str(status)
-            if status != 0:
+            if status in [1, 2, 3]:
                 status_str = f"{status}:{self.last_threat_score:.1f}"
             
             self.path_log.append({

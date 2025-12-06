@@ -28,10 +28,14 @@ def run_monte_carlo():
     n_host_a = get_user_input("No. of Hostile Air", 3, int)
     n_iter = get_user_input("Number of Iterations", 1, int)
     
+    comm_input = input("Enable Communication? (yes/no) [Default: yes]: ").strip().lower()
+    communication_enabled = True if comm_input in ["", "yes", "y"] else False
+    
     results_history = []
     batch_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     
     print(f"\n[SYSTEM] Starting {n_iter} Iterations...")
+    print(f"[SYSTEM] Communication: {'ENABLED' if communication_enabled else 'DISABLED'}")
 
     for i in range(n_iter):
         # 1. Run Simulation
@@ -41,7 +45,7 @@ def run_monte_carlo():
             "num_hostiles_ground": n_host_g,
             "num_hostiles_air": n_host_a,
             "asset_patrol_radius": 2000.0,
-            "communication_enabled": True
+            "communication_enabled": communication_enabled
         }
         
         sim = Simulation(config)
